@@ -1,11 +1,9 @@
 name: Job Hunter
 
 on:
-  # Run automatically every 6 hours
   schedule:
     - cron: "0 */6 * * *"
 
-  # Allows you to manually run it from GitHub
   workflow_dispatch:
 
 jobs:
@@ -15,22 +13,18 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # 1. Download repository code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Install Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
-      # 3. Install dependencies
       - name: Install dependencies
         run: npm ci
 
-      # 4. Run Job Hunter
       - name: Run Job Hunter
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
