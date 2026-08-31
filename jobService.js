@@ -345,3 +345,43 @@ export async function updateApplicationStatus(jobId, status) {
     },
   );
 }
+
+export async function updateNotificationStatus(jobId, status) {
+  return Job.findOneAndUpdate(
+    { jobId },
+    {
+      $set: {
+        notificationStatus: status,
+        slackNotified: status === "sent",
+        ...(status === "sent" ? { slackNotifiedAt: new Date() } : {}),
+      },
+    },
+    { new: true },
+  );
+}
+
+export async function markJobsAIFailed(
+  jobs,
+  errorMessage = "Gemini evaluation failed.",
+) {
+  const ids = jobs.map((job) => job._id);
+
+  if (!ids.length) {
+    return;
+  }
+
+  await Job.updateMany(
+    {
+      _id: {
+        $in: ids,
+      },
+    },
+    {
+      $set: {
+        aiStatus: "failed",
+        aiError: errorMessage,
+        aiProcessedAt: new Date(),
+      },
+    },
+  );
+}

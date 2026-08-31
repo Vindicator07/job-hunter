@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 
 import { config } from "./config.js";
+
 import { MAX_AI_BATCH_SIZE } from "./constants.js";
 
 import {
@@ -10,6 +11,7 @@ import {
   markJobsPending,
   markJobsFailed,
   saveAIResults,
+  updateNotificationStatus,
 } from "./jobService.js";
 
 import { scrapeAllJobSearches } from "./apify.js";
@@ -28,102 +30,114 @@ async function run() {
   console.log("Connected to MongoDB.");
 
   try {
-    /*
-     * 1. Get jobs that were left pending
-     *    from previous runs.
-     */
+    /* =========================================================
+       1. GET PENDING / FAILED JOBS
+       ========================================================= */
+
     const pendingJobs = await getPendingJobs();
 
     if (pendingJobs.length > 0) {
       console.log(
-        `🔄 Found ${pendingJobs.length} pending jobs from previous runs.`,
+        `🔄 Found ${pendingJobs.length} pending/failed jobs from previous runs.`,
       );
     } else {
       console.log("🔄 No pending jobs from previous runs.");
     }
 
-    /*
-     * 2. Scrape fresh jobs from LinkedIn
-     *    through Apify.
-     */
+    /* =========================================================
+       2. SCRAPE FRESH JOBS
+       ========================================================= */
+
     const scrapedJobs = await scrapeAllJobSearches();
 
     console.log(`📊 Scraped ${scrapedJobs.length} unique jobs.`);
 
-    /*
-     * 3. Apply our cheap/local filters:
-     *
-     *    - Maximum 7 days old
-     *    - Backend / Node.js / TypeScript /
-     *      Full-stack / relevant software roles
-     */
+    /* =========================================================
+       3. APPLY LOCAL FILTERS
+       
+       - Maximum 7 days old
+       - Backend / Node.js / TypeScript
+       - Full-stack / relevant software roles
+       ========================================================= */
+
     const relevantJobs = filterFreshRelevantJobs(scrapedJobs);
 
     console.log(`🎯 ${relevantJobs.length} jobs passed local filtering.`);
 
-    /*
-     * 4. Save new jobs to MongoDB.
-     *
-     *    New jobs are stored as:
-     *
-     *    aiStatus = pending
-     *
-     *    They are NOT sent directly to Gemini here.
-     */
+    /* =========================================================
+       4. SAVE NEW JOBS TO MONGODB
+
+       New jobs start with:
+
+       aiStatus = pending
+       applicationStatus = not_applied
+       ========================================================= */
+
     const newJobs = await saveNewJobs(relevantJobs);
 
-    /*
-     * 5. Combine:
-     *
-     *    old pending jobs
-     *          +
-     *    newly discovered jobs
-     *
-     *    This is our AI queue.
-     */
+    /* =========================================================
+       5. BUILD AI QUEUE
+
+       Previous pending jobs
+              +
+       Newly discovered jobs
+              ↓
+       AI queue
+       ========================================================= */
+
     const jobsWaitingForAI = [...pendingJobs, ...newJobs];
 
     console.log(
       `🤖 ${jobsWaitingForAI.length} jobs are waiting for AI evaluation.`,
     );
 
-    /*
-     * 6. Protect Gemini quota.
-     *
-     *    We evaluate only a small batch
-     *    on each run.
-     */
+    /* =========================================================
+       6. PROTECT GEMINI QUOTA
+
+       Only process a limited number of jobs per run.
+       ========================================================= */
+
     const aiBatch = jobsWaitingForAI.slice(0, MAX_AI_BATCH_SIZE);
 
     console.log(`🤖 ${aiBatch.length} jobs will be evaluated in this run.`);
 
     if (aiBatch.length === 0) {
       console.log("No jobs require AI evaluation.");
-
       return;
     }
 
-    /*
-     * 7. Mark jobs as "processing" before
-     *    calling Gemini.
-     */
+    /* =========================================================
+       7. MARK JOBS AS PROCESSING
+
+       This happens BEFORE calling Gemini.
+
+       aiStatus:
+       pending → processing
+       ========================================================= */
+
     await markJobsProcessing(aiBatch);
 
-    /*
-     * 8. Send the batch to Gemini.
-     */
+    /* =========================================================
+       8. SEND BATCH TO GEMINI
+       ========================================================= */
+
+    console.log(`🤖 Sending ${aiBatch.length} jobs to Gemini...`);
+
     const aiResponse = await evaluateJobsWithGemini(aiBatch);
 
-    /*
-     * 9. Gemini quota/rate limit.
-     *
-     *    IMPORTANT:
-     *
-     *    We don't lose the jobs.
-     *
-     *    They go back to pending and will
-     *    be retried during a future run.
-     */
+    /* =========================================================
+       9. GEMINI QUOTA / RATE LIMIT
+
+       IMPORTANT:
+
+       Quota errors are temporary.
+
+       Therefore:
+       processing → pending
+
+       These jobs can be retried during the next run.
+       ========================================================= */
+
     if (aiResponse.status === "quota") {
       await markJobsPending(aiBatch, "Gemini quota/rate limit reached.");
 
@@ -136,56 +150,104 @@ async function run() {
       return;
     }
 
-    /*
-     * 10. General Gemini failure.
-     *
-     *     We don't pretend the jobs were
-     *     successfully evaluated.
-     */
+    /* =========================================================
+       10. GENERAL GEMINI FAILURE
+
+       The AI request failed for a reason other than
+       quota/rate limiting.
+
+       processing → failed
+
+       Notification status:
+       pending → ai_failed
+       ========================================================= */
+
     if (aiResponse.status === "failed") {
       await markJobsFailed(aiBatch, "Gemini evaluation failed.");
 
+      for (const job of aiBatch) {
+        await updateNotificationStatus(job.jobId, "ai_failed");
+      }
+
       console.log("⚠️ Gemini evaluation failed.");
+
+      console.log(`❌ Marked ${aiBatch.length} jobs as AI failed.`);
 
       return;
     }
 
-    /*
-     * 11. Save Gemini results.
-     *
-     *     This updates:
-     *
-     *     - score
-     *     - analysis
-     *     - missing skills
-     *     - aiStatus
-     *     - applicationStatus
-     */
+    /* =========================================================
+       11. SAVE GEMINI RESULTS
+
+       Updates:
+
+       - score
+       - analysis
+       - missing skills
+       - aiStatus
+       - aiProcessedAt
+       - applicationStatus
+
+       If Gemini returns fewer results than expected,
+       saveAIResults() returns those jobs to pending.
+       ========================================================= */
+
     await saveAIResults(aiBatch, aiResponse.results);
 
-    /*
-     * 12. Notify Slack only for strong
-     *     matches.
-     */
+    /* =========================================================
+       12. SLACK NOTIFICATIONS
+
+       Score >= 7
+           ↓
+       Send to Slack
+
+       Score < 7
+           ↓
+       Do not send
+       notificationStatus = below_threshold
+       ========================================================= */
+
     for (const result of aiResponse.results) {
       const job = aiBatch[result.index];
 
       if (!job) {
+        console.log(`⚠️ No job found for AI result index ${result.index}`);
+
         continue;
       }
 
-      if (result.shortlist_score >= 7) {
+      const score = Number(result.shortlist_score);
+
+      /* =====================================================
+         HIGH-SCORING JOB
+         ===================================================== */
+
+      if (score >= 7) {
         const sent = await sendSlackNotification(job, result);
 
-        if (!sent) {
-          console.log(`⚠️ Slack notification failed for ${job.title}`);
+        if (sent) {
+          await updateNotificationStatus(job.jobId, "sent");
+
+          console.log(`✅ Slack notification sent for ${job.title}`);
+        } else {
+          await updateNotificationStatus(job.jobId, "slack_failed");
+
+          console.log(`❌ Slack notification failed for ${job.title}`);
         }
       } else {
-        console.log(
-          `📭 Not sending to Slack: ${job.title} (${result.shortlist_score}/10)`,
-        );
+
+      /* =====================================================
+         LOW-SCORING JOB
+         ===================================================== */
+        await updateNotificationStatus(job.jobId, "below_threshold");
+
+        console.log(`📭 Not sending to Slack: ${job.title} (${score}/10)`);
       }
     }
+
+    /* =========================================================
+       13. PIPELINE COMPLETE
+       ========================================================= */
 
     console.log("✅ Pipeline run complete.");
   } catch (error) {
@@ -196,5 +258,9 @@ async function run() {
     console.log("MongoDB connection closed.");
   }
 }
+
+/* =========================================================
+   START PIPELINE
+   ========================================================= */
 
 run();

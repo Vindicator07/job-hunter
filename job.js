@@ -92,6 +92,12 @@ const jobSchema = new mongoose.Schema(
       type: String,
     },
 
+    notificationStatus: {
+      type: String,
+      enum: ["pending", "sent", "below_threshold", "ai_failed", "slack_failed"],
+      default: "pending",
+    },
+
     /*
      * =====================================================
      * SLACK
@@ -105,6 +111,7 @@ const jobSchema = new mongoose.Schema(
 
     slackNotifiedAt: {
       type: Date,
+      default: null,
     },
 
     /*
